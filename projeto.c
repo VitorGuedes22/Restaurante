@@ -40,9 +40,11 @@ int id_disponiveis[NUM_COZINHEIROS];
 
 
 typedef struct {
-    sem_t** semaphores;  // Array de ponteiros para semáforos
-    char** resource_names;  // Array de nomes dos recursos
-    int size;            // Tamanho do array de semáforos e nomes
+    sem_t** semaphores;          // Array de ponteiros para semáforos
+    char** resource_names;       // Array de nomes dos recursos
+    pthread_mutex_t* mutexes;    // Array de mutexes para cada recurso
+    pthread_cond_t* conds;       // Array de variáveis de condição para cada recurso
+    int size;                    // Tamanho do array de semáforos
 } SemaphoreArray;
 
 typedef struct {
@@ -82,15 +84,20 @@ int countSemaphores(sem_t** semaphoreArray) {
     return count;
 }
 
-void addSemaphoreArray(Dictionary* dict, const char* key, sem_t** semaphoreArray, const char** resourceNames) {
+void addSemaphoreArray(Dictionary* dict, const char* key, sem_t** semaphoreArray, char** resourceNames, int size) {
     dict->entries[dict->size].key = strdup(key);
     dict->entries[dict->size].value.semaphores = semaphoreArray;
-    dict->entries[dict->size].value.size = countSemaphores(semaphoreArray);
-    
-    // Alocar e copiar os nomes dos recursos
-    dict->entries[dict->size].value.resource_names = malloc(dict->entries[dict->size].value.size * sizeof(char*));
-    for (int i = 0; i < dict->entries[dict->size].value.size; i++) {
-        dict->entries[dict->size].value.resource_names[i] = strdup(resourceNames[i]);
+    dict->entries[dict->size].value.resource_names = resourceNames;
+    dict->entries[dict->size].value.size = size;
+
+    // Alocando espaço para os mutexes e variáveis de condição
+    dict->entries[dict->size].value.mutexes = malloc(size * sizeof(pthread_mutex_t));
+    dict->entries[dict->size].value.conds = malloc(size * sizeof(pthread_cond_t));
+
+    // Inicializando mutexes e variáveis de condição
+    for (int i = 0; i < size; i++) {
+        pthread_mutex_init(&dict->entries[dict->size].value.mutexes[i], NULL);
+        pthread_cond_init(&dict->entries[dict->size].value.conds[i], NULL);
     }
 
     dict->size++;
@@ -109,6 +116,15 @@ void freeDictionary(Dictionary* dict) {
     for (int i = 0; i < dict->size; i++) {
         free(dict->entries[i].key);
         free(dict->entries[i].value.semaphores);
+
+        // Destruindo mutexes e variáveis de condição
+        for (int j = 0; j < dict->entries[i].value.size; j++) {
+            pthread_mutex_destroy(&dict->entries[i].value.mutexes[j]);
+            pthread_cond_destroy(&dict->entries[i].value.conds[j]);
+        }
+
+        free(dict->entries[i].value.mutexes);
+        free(dict->entries[i].value.conds);
     }
     free(dict->entries);
 }
@@ -179,34 +195,39 @@ void* cozinheiro(void* arg) {
         for (int i = 0; i < recursos->size; i++) {
             sem_t* recurso = recursos->semaphores[i];
             char* nome_recurso = recursos->resource_names[i];
+            pthread_mutex_t* mutex = &recursos->mutexes[i];
+            pthread_cond_t* cond = &recursos->conds[i];
 
             printf("Cozinheiro %d necessita usar o recurso %s para fazer %s.\n", id_cozinheiro, nome_recurso, receita);
 
-            while (1) {
-                int recurso_disponivel;
-                sem_getvalue(recurso,&recurso_disponivel);
-                
-                if (recurso_disponivel == 0) {
-                    printf("%s esta indisponivel para o cozinheiro %d fazer %s \n", nome_recurso,id_cozinheiro,receita);
-                    continue;
-                } else {
-                    sem_wait(recurso);
-                        printf("Cozinheiro %d esta usando o recurso %s para fazer %s.\n", id_cozinheiro,nome_recurso,receita);
+            pthread_mutex_lock(mutex);
+                while (1) {
+                    int recurso_disponivel;
+                    sem_getvalue(recurso, &recurso_disponivel);
+
+                    if (recurso_disponivel == 0) {
+                        printf("%s está indisponível para o cozinheiro %d fazer %s \n", nome_recurso, id_cozinheiro, receita);
+                        pthread_cond_wait(cond, mutex);  // Espera até que o recurso esteja disponível
                     
-                        int tempo = rand() %10 + 5; 
-                        sleep(tempo);
-                    
-                        printf("Cozinheiro %d finalizou com o uso de %s para fazer %s.\n", id_cozinheiro,nome_recurso,receita);
-                    
-                    sem_post(recurso);
-                    
-                    break;
+                    } else {
+                        sem_wait(recurso);
+                            printf("Cozinheiro %d está usando o recurso %s para fazer %s.\n", id_cozinheiro, nome_recurso, receita);
+
+                            int tempo = rand() % 10 + 5;
+                            sleep(tempo);
+
+                            printf("Cozinheiro %d finalizou o uso de %s para fazer %s.\n", id_cozinheiro, nome_recurso, receita);
+
+                        sem_post(recurso);
+                        
+                        pthread_cond_broadcast(cond);  // Sinaliza que o recurso está disponível novamente
+                        break;
+                    }
                 }
-            }
+            pthread_mutex_unlock(mutex);
         }
-        
+
         printf("Receita %s finalizada pelo Cozinheiro %d.\n", receita, id_cozinheiro);
-        
     }
 
     pthread_mutex_lock(&cozinheiros_lock);
@@ -232,10 +253,10 @@ int main() {
 
     const char* nomes_recursos_file[] = { "Fogão", "Panela", "Bancada" };
     const char* nomes_recursos_lasanha[] = { "Fogão", "Panela", "Forno", "Bancada" };
-    const char* nomes_recursos_risoto[] = { "Fogão", "Panela", "Bancada" };
+    const char* nomes_recursos_risoto[] = { "Fogão", "Panela", "Bancada"};
     const char* nomes_recursos_salmao[] = { "Grill", "Bancada" };
     const char* nomes_recursos_pizza[] = { "Forno", "Bancada" };
-    const char* nomes_recursos_costela[] = { "Bancada", "Bancada" };
+    const char* nomes_recursos_costela[] = { "Bancada", "Panela","Forno","Grill"};
 
     // Criando arrays de ponteiros para os semáforos e terminando com NULL
     sem_t* recursos_file[] = { &sem_fogao, &sem_panela, &sem_bancada, NULL };
@@ -243,14 +264,14 @@ int main() {
     sem_t* recursos_risoto[] = { &sem_fogao, &sem_panela, &sem_bancada, NULL };
     sem_t* recursos_salmao[] = { &sem_grill, &sem_bancada, NULL };
     sem_t* recursos_pizza[] = { &sem_forno, &sem_bancada, NULL };
-    sem_t* recursos_costela[] = { &sem_bancada, &sem_bancada, NULL };
+    sem_t* recursos_costela[] = { &sem_bancada, &sem_panela,&sem_forno,&sem_grill, NULL };
 
-    addSemaphoreArray(&receitas, "file", recursos_file, nomes_recursos_file);
-    addSemaphoreArray(&receitas, "lasanha", recursos_lasanha, nomes_recursos_lasanha);
-    addSemaphoreArray(&receitas, "risoto", recursos_risoto, nomes_recursos_risoto);
-    addSemaphoreArray(&receitas, "salmao", recursos_salmao, nomes_recursos_salmao);
-    addSemaphoreArray(&receitas, "pizza", recursos_pizza, nomes_recursos_pizza);
-    addSemaphoreArray(&receitas, "costela", recursos_costela, nomes_recursos_costela);
+    addSemaphoreArray(&receitas, "file", recursos_file, nomes_recursos_file, 3);
+    addSemaphoreArray(&receitas, "lasanha", recursos_lasanha, nomes_recursos_lasanha, 4);
+    addSemaphoreArray(&receitas, "risoto", recursos_risoto, nomes_recursos_risoto, 3);
+    addSemaphoreArray(&receitas, "salmao", recursos_salmao, nomes_recursos_salmao, 2);
+    addSemaphoreArray(&receitas, "pizza", recursos_pizza, nomes_recursos_pizza, 2);
+    addSemaphoreArray(&receitas, "costela", recursos_costela, nomes_recursos_costela, 4);
 
     char* menu[NUM_RECEITAS] = {"file", "lasanha", "risoto", "salmao", "pizza", "costela"};
 
