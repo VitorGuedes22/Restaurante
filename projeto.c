@@ -6,17 +6,43 @@
 #include <pthread.h>
 
 
-#define NUM_FOGAO 2
-#define NUM_PANELA 3
+#define NUM_FOGAO 1
+#define NUM_PANELA 1
 #define NUM_FORNO 1
-#define NUM_BANCADA 2
+#define NUM_BANCADA 1
 #define NUM_GRILL 1
 #define NUM_RECEITAS 6
 #define NUM_COZINHEIROS 4
 
+
+// Semáforos para os recursos
+sem_t sem_fogao;
+sem_t sem_panela;
+sem_t sem_forno;
+sem_t sem_bancada;
+sem_t sem_grill;
+sem_t sem_cozinheiros;
+
+
+pthread_mutex_t print_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t recurso_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t cozinheiros_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t cozinheiros_disponiveis_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
+
+pthread_cond_t cozinheiro_cond = PTHREAD_COND_INITIALIZER;
+pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
+
+pthread_t cozinheiro_tid[NUM_COZINHEIROS];
+
+// Vetor para rastrear IDs de cozinheiros
+int id_disponiveis[NUM_COZINHEIROS];
+
+
 typedef struct {
     sem_t** semaphores;  // Array de ponteiros para semáforos
-    int size;            // Tamanho do array de semáforos
+    char** resource_names;  // Array de nomes dos recursos
+    int size;            // Tamanho do array de semáforos e nomes
 } SemaphoreArray;
 
 typedef struct {
@@ -39,6 +65,10 @@ typedef struct Node {
     struct Node* next;
 } Node;
 
+Dictionary receitas;
+Node* head = NULL;
+Node* tail = NULL;
+
 void initDictionary(Dictionary* dict, int initialSize) {
     dict->entries = (DictionaryEntry*)malloc(initialSize * sizeof(DictionaryEntry));
     dict->size = 0;
@@ -52,10 +82,16 @@ int countSemaphores(sem_t** semaphoreArray) {
     return count;
 }
 
-void addSemaphoreArray(Dictionary* dict, const char* key, sem_t** semaphoreArray) {
+void addSemaphoreArray(Dictionary* dict, const char* key, sem_t** semaphoreArray, const char** resourceNames) {
     dict->entries[dict->size].key = strdup(key);
     dict->entries[dict->size].value.semaphores = semaphoreArray;
     dict->entries[dict->size].value.size = countSemaphores(semaphoreArray);
+    
+    // Alocar e copiar os nomes dos recursos
+    dict->entries[dict->size].value.resource_names = malloc(dict->entries[dict->size].value.size * sizeof(char*));
+    for (int i = 0; i < dict->entries[dict->size].value.size; i++) {
+        dict->entries[dict->size].value.resource_names[i] = strdup(resourceNames[i]);
+    }
 
     dict->size++;
 }
@@ -77,11 +113,26 @@ void freeDictionary(Dictionary* dict) {
     free(dict->entries);
 }
 
+void mostrarCozinheirosDisponiveis() {
+    pthread_mutex_lock(&cozinheiros_disponiveis_lock); // Protege o acesso ao array de IDs disponíveis
+        printf("Cozinheiros disponíveis: ");
+        int disponiveis = 0;
+        for (int i = 0; i < NUM_COZINHEIROS; i++) {
+            if (id_disponiveis[i] == 1) {
+                printf("%d ", i + 1);  // IDs dos cozinheiros começam em 1
+                disponiveis++;
+            }
+        }
+        
+        if (disponiveis == 0) {
+            printf("Nenhum cozinheiro disponível.");
+        }
+        
+        printf("\n");
 
-Node* head = NULL;
-Node* tail = NULL;
-pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
+    pthread_mutex_unlock(&cozinheiros_disponiveis_lock); // Libera o mutex
+}
+
 
 void enqueue(int id) {
     Node* newNode = (Node*)malloc(sizeof(Node));
@@ -89,53 +140,32 @@ void enqueue(int id) {
     newNode->next = NULL;
 
     pthread_mutex_lock(&queue_lock);
-    if (tail == NULL) {
-        head = tail = newNode;
-    } else {
-        tail->next = newNode;
-        tail = newNode;
-    }
-    pthread_cond_signal(&queue_cond);
+        if (tail == NULL) {
+            head = tail = newNode;
+        } else {
+            tail->next = newNode;
+            tail = newNode;
+        }
+        pthread_cond_signal(&queue_cond);
     pthread_mutex_unlock(&queue_lock);
 }
 
 int dequeue() {
     pthread_mutex_lock(&queue_lock);
-    while (head == NULL) {
-        pthread_cond_wait(&queue_cond, &queue_lock);
-    }
-    Node* temp = head;
-    int id = temp->id;
-    head = head->next;
-    if (head == NULL) {
-        tail = NULL;
-    }
-    free(temp);
+        while (head == NULL) {
+            pthread_cond_wait(&queue_cond, &queue_lock);
+        }
+        Node* temp = head;
+        int id = temp->id;
+        head = head->next;
+        if (head == NULL) {
+            tail = NULL;
+        }
+        free(temp);
     pthread_mutex_unlock(&queue_lock);
     return id;
 }
 
-Dictionary receitas;
-
-// Semáforos para os recursos
-sem_t sem_fogao;
-sem_t sem_panela;
-sem_t sem_forno;
-sem_t sem_bancada;
-sem_t sem_grill;
-sem_t sem_cozinheiros;
-
-
-pthread_mutex_t print_lock = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t recurso_lock = PTHREAD_MUTEX_INITIALIZER;
-pthread_mutex_t cozinheiros_lock = PTHREAD_MUTEX_INITIALIZER;
-
-pthread_cond_t cozinheiro_cond = PTHREAD_COND_INITIALIZER;
-
-pthread_t cozinheiro_tid[NUM_COZINHEIROS];
-
-// Vetor para rastrear IDs de cozinheiros
-int id_disponiveis[NUM_COZINHEIROS];
 
 void* cozinheiro(void* arg) {
     CozinheiroInfo* info = (CozinheiroInfo*)arg;
@@ -143,28 +173,31 @@ void* cozinheiro(void* arg) {
     int id_cozinheiro = info->id;
     SemaphoreArray* recursos = getSemaphoreArray(&receitas, receita);
 
-    printf("cozinheiro %d começando %s", id_cozinheiro,receita);
+    printf("Cozinheiro %d começando %s \n", id_cozinheiro, receita);
 
     if (recursos != NULL) {
         for (int i = 0; i < recursos->size; i++) {
             sem_t* recurso = recursos->semaphores[i];
+            char* nome_recurso = recursos->resource_names[i];
 
-            printf("Cozinheiro %d quer usar o recurso para fazer %s.\n", id_cozinheiro, receita);
+            printf("Cozinheiro %d necessita usar o recurso %s para fazer %s.\n", id_cozinheiro, nome_recurso, receita);
 
             while (1) {
                 int recurso_disponivel;
                 sem_getvalue(recurso,&recurso_disponivel);
                 
                 if (recurso_disponivel == 0) {
+                    printf("%s esta indisponivel para o cozinheiro %d fazer %s \n", nome_recurso,id_cozinheiro,receita);
                     continue;
                 } else {
                     sem_wait(recurso);
-                        printf("Cozinheiro %d usou o recurso para fazer %s.\n", id_cozinheiro,receita);
+                        printf("Cozinheiro %d esta usando o recurso %s para fazer %s.\n", id_cozinheiro,nome_recurso,receita);
                     
-                        int tempo = rand() %20 + 5; 
+                        int tempo = rand() %10 + 5; 
                         sleep(tempo);
                     
-                        printf("Cozinheiro %d finalizou o uso do recurso para %s.\n", id_cozinheiro, receita);
+                        printf("Cozinheiro %d finalizou com o uso de %s para fazer %s.\n", id_cozinheiro,nome_recurso,receita);
+                    
                     sem_post(recurso);
                     
                     break;
@@ -197,6 +230,13 @@ int main() {
     sem_init(&sem_grill, 0, NUM_GRILL);
     sem_init(&sem_cozinheiros, 0, NUM_COZINHEIROS);
 
+    const char* nomes_recursos_file[] = { "Fogão", "Panela", "Bancada" };
+    const char* nomes_recursos_lasanha[] = { "Fogão", "Panela", "Forno", "Bancada" };
+    const char* nomes_recursos_risoto[] = { "Fogão", "Panela", "Bancada" };
+    const char* nomes_recursos_salmao[] = { "Grill", "Bancada" };
+    const char* nomes_recursos_pizza[] = { "Forno", "Bancada" };
+    const char* nomes_recursos_costela[] = { "Bancada", "Bancada" };
+
     // Criando arrays de ponteiros para os semáforos e terminando com NULL
     sem_t* recursos_file[] = { &sem_fogao, &sem_panela, &sem_bancada, NULL };
     sem_t* recursos_lasanha[] = { &sem_fogao, &sem_panela, &sem_forno, &sem_bancada, NULL };
@@ -205,13 +245,12 @@ int main() {
     sem_t* recursos_pizza[] = { &sem_forno, &sem_bancada, NULL };
     sem_t* recursos_costela[] = { &sem_bancada, &sem_bancada, NULL };
 
-    // Adicionando os recursos de cada receita no dicionário de receitas
-    addSemaphoreArray(&receitas, "file", recursos_file);
-    addSemaphoreArray(&receitas, "lasanha", recursos_lasanha);
-    addSemaphoreArray(&receitas, "risoto", recursos_risoto);
-    addSemaphoreArray(&receitas, "salmao", recursos_salmao);
-    addSemaphoreArray(&receitas, "pizza", recursos_pizza);
-    addSemaphoreArray(&receitas, "costela", recursos_costela);
+    addSemaphoreArray(&receitas, "file", recursos_file, nomes_recursos_file);
+    addSemaphoreArray(&receitas, "lasanha", recursos_lasanha, nomes_recursos_lasanha);
+    addSemaphoreArray(&receitas, "risoto", recursos_risoto, nomes_recursos_risoto);
+    addSemaphoreArray(&receitas, "salmao", recursos_salmao, nomes_recursos_salmao);
+    addSemaphoreArray(&receitas, "pizza", recursos_pizza, nomes_recursos_pizza);
+    addSemaphoreArray(&receitas, "costela", recursos_costela, nomes_recursos_costela);
 
     char* menu[NUM_RECEITAS] = {"file", "lasanha", "risoto", "salmao", "pizza", "costela"};
 
@@ -220,7 +259,7 @@ int main() {
         id_disponiveis[i] = 1;  // 1 significa disponível
     }
 
-    printf("vai comecar o loop infinito \n");
+    printf("Restaurante abriu!\n");
 
     int quant_loop = 0;
     while (quant_loop < 10) {
@@ -228,14 +267,13 @@ int main() {
             int quant_cozinheiros;
             sem_getvalue(&sem_cozinheiros,&quant_cozinheiros);
             
-            printf("Valor do semaforo de cozinheiros: %d\n", quant_cozinheiros);
+            printf("Quantidade de cozinheiros disponiveis: %d\n", quant_cozinheiros);
             
             while (quant_cozinheiros == 0) {
                 pthread_cond_wait(&cozinheiro_cond, &cozinheiros_lock);
                 sem_getvalue(&sem_cozinheiros,&quant_cozinheiros);
             }
             
-
             // Procurar um ID disponível
             int id_disponivel = -1;
             for (int i = 0; i < NUM_COZINHEIROS; i++) {
@@ -247,11 +285,12 @@ int main() {
                 }
             }
 
-            printf("id_disponivel achado: %d \n",id_disponivel);
+            //mostrarCozinheirosDisponiveis();
 
             // Esperar até que seja a vez do próximo cozinheiro
             if (id_disponivel != -1) {
                 id_disponivel = dequeue();  // Remove da fila FIFO
+                sem_wait(&sem_cozinheiros);
             }
         pthread_mutex_unlock(&cozinheiros_lock);
 
